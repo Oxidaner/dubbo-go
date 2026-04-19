@@ -36,6 +36,7 @@ import (
 	"dubbo.apache.org/dubbo-go/v3/common"
 	"dubbo.apache.org/dubbo-go/v3/common/constant"
 	"dubbo.apache.org/dubbo-go/v3/common/dubboutil"
+	"dubbo.apache.org/dubbo-go/v3/graceful_shutdown"
 	"dubbo.apache.org/dubbo-go/v3/metadata"
 	"dubbo.apache.org/dubbo-go/v3/metrics/probe"
 	"dubbo.apache.org/dubbo-go/v3/registry/exposed_tmp"
@@ -288,6 +289,14 @@ func (s *Server) exportServices() error {
 }
 
 func (s *Server) Serve() error {
+	return s.ServeContext(context.Background())
+}
+
+func (s *Server) ServeContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	s.mu.Lock()
 	if s.serve {
 		// release lock in case causing deadlock
@@ -299,6 +308,11 @@ func (s *Server) Serve() error {
 
 	// release lock in case causing deadlock
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.serve = false
+		s.mu.Unlock()
+	}()
 
 	// the registryConfig in ServiceOptions and ServerOptions all need to init a metadataReporter,
 	// when ServiceOptions.init() is called we don't know if a new registry config is set in the future use serviceOption
@@ -329,7 +343,17 @@ func (s *Server) Serve() error {
 	probe.SetStartupComplete(true)
 	probe.SetReady(true)
 
-	select {}
+	if done := ctx.Done(); done != nil {
+		select {
+		case <-graceful_shutdown.Done():
+			return graceful_shutdown.Shutdown(ctx)
+		case <-done:
+			return graceful_shutdown.Shutdown(ctx)
+		}
+	}
+
+	<-graceful_shutdown.Done()
+	return graceful_shutdown.Shutdown(context.Background())
 }
 
 // In order to expose internal services

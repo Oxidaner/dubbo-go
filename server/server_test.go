@@ -19,10 +19,14 @@ package server
 
 import (
 	"context"
+	"os"
+	"os/signal"
 	"reflect"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -33,8 +37,193 @@ import (
 
 import (
 	"dubbo.apache.org/dubbo-go/v3/common"
+	"dubbo.apache.org/dubbo-go/v3/common/constant"
+	"dubbo.apache.org/dubbo-go/v3/common/extension"
 	"dubbo.apache.org/dubbo-go/v3/global"
+	"dubbo.apache.org/dubbo-go/v3/graceful_shutdown"
+	"dubbo.apache.org/dubbo-go/v3/protocol/base"
+	"dubbo.apache.org/dubbo-go/v3/registry"
 )
+
+//go:linkname extensionProtocols dubbo.apache.org/dubbo-go/v3/common/extension.protocols
+var extensionProtocols *extension.Registry[func() base.Protocol]
+
+//go:linkname gracefulShutdownInitOnce dubbo.apache.org/dubbo-go/v3/graceful_shutdown.initOnce
+var gracefulShutdownInitOnce sync.Once
+
+//go:linkname gracefulShutdownProtocols dubbo.apache.org/dubbo-go/v3/graceful_shutdown.protocols
+var gracefulShutdownProtocols map[string]struct{}
+
+//go:linkname gracefulShutdownProMu dubbo.apache.org/dubbo-go/v3/graceful_shutdown.proMu
+var gracefulShutdownProMu sync.Mutex
+
+//go:linkname gracefulShutdownConfigMu dubbo.apache.org/dubbo-go/v3/graceful_shutdown.shutdownConfigMu
+var gracefulShutdownConfigMu sync.RWMutex
+
+//go:linkname gracefulShutdownConfig dubbo.apache.org/dubbo-go/v3/graceful_shutdown.shutdownConfig
+var gracefulShutdownConfig *global.ShutdownConfig
+
+//go:linkname gracefulShutdownOnce dubbo.apache.org/dubbo-go/v3/graceful_shutdown.shutdownOnce
+var gracefulShutdownOnce sync.Once
+
+//go:linkname gracefulShutdownStarted dubbo.apache.org/dubbo-go/v3/graceful_shutdown.shutdownStarted
+var gracefulShutdownStarted atomic.Bool
+
+//go:linkname gracefulShutdownDone dubbo.apache.org/dubbo-go/v3/graceful_shutdown.shutdownDone
+var gracefulShutdownDone chan struct{}
+
+//go:linkname gracefulShutdownResult dubbo.apache.org/dubbo-go/v3/graceful_shutdown.shutdownResult
+var gracefulShutdownResult error
+
+//go:linkname gracefulShutdownSignalNotify dubbo.apache.org/dubbo-go/v3/graceful_shutdown.signalNotify
+var gracefulShutdownSignalNotify func(chan<- os.Signal, ...os.Signal)
+
+func resetInternalProviderServicesForTest(t *testing.T) {
+	t.Helper()
+
+	internalProLock.Lock()
+	originalServices := internalProServices
+	internalProServices = nil
+	internalProLock.Unlock()
+
+	t.Cleanup(func() {
+		internalProLock.Lock()
+		defer internalProLock.Unlock()
+		internalProServices = originalServices
+	})
+}
+
+type mockServeProtocol struct {
+	base.BaseProtocol
+}
+
+type mockServeRegistryFactoryProtocol struct {
+	base.BaseProtocol
+}
+
+type mockServeRegistry struct{}
+
+func (p *mockServeRegistryFactoryProtocol) GetRegistries() []registry.Registry {
+	return []registry.Registry{&mockServeRegistry{}}
+}
+
+func (r *mockServeRegistry) GetURL() *common.URL {
+	return &common.URL{}
+}
+
+func (r *mockServeRegistry) IsAvailable() bool {
+	return true
+}
+
+func (r *mockServeRegistry) Destroy() {}
+
+func (r *mockServeRegistry) Register(*common.URL) error {
+	return nil
+}
+
+func (r *mockServeRegistry) UnRegister(*common.URL) error {
+	return nil
+}
+
+func (r *mockServeRegistry) Subscribe(*common.URL, registry.NotifyListener) error {
+	return nil
+}
+
+func (r *mockServeRegistry) UnSubscribe(*common.URL, registry.NotifyListener) error {
+	return nil
+}
+
+func (r *mockServeRegistry) LoadSubscribeInstances(*common.URL, registry.NotifyListener) error {
+	return nil
+}
+
+func (r *mockServeRegistry) RegisterService() error {
+	return nil
+}
+
+func (r *mockServeRegistry) UnRegisterService() error {
+	return nil
+}
+
+func registerServeTestProtocols(t *testing.T) {
+	t.Helper()
+
+	originalProtocols := extensionProtocols.Snapshot()
+	extension.SetProtocol("dubbo", func() base.Protocol {
+		return &mockServeProtocol{BaseProtocol: base.NewBaseProtocol()}
+	})
+	extension.SetProtocol(constant.RegistryKey, func() base.Protocol {
+		return &mockServeRegistryFactoryProtocol{BaseProtocol: base.NewBaseProtocol()}
+	})
+	t.Cleanup(func() {
+		for name, factory := range originalProtocols {
+			extension.SetProtocol(name, factory)
+		}
+		if _, ok := originalProtocols["dubbo"]; !ok {
+			extension.UnregisterProtocol("dubbo")
+		}
+		if _, ok := originalProtocols[constant.RegistryKey]; !ok {
+			extension.UnregisterProtocol(constant.RegistryKey)
+		}
+	})
+}
+
+func resetGracefulShutdownStateForTest(t *testing.T) {
+	t.Helper()
+
+	gracefulShutdownInitOnce = sync.Once{}
+	gracefulShutdownProtocols = nil
+	gracefulShutdownProMu = sync.Mutex{}
+	gracefulShutdownConfigMu = sync.RWMutex{}
+	gracefulShutdownConfig = nil
+	gracefulShutdownOnce = sync.Once{}
+	gracefulShutdownStarted = atomic.Bool{}
+	gracefulShutdownDone = make(chan struct{})
+	gracefulShutdownResult = nil
+	gracefulShutdownSignalNotify = signal.Notify
+}
+
+func TestServeContextReturnsAfterContextCancellation(t *testing.T) {
+	resetGracefulShutdownStateForTest(t)
+	t.Cleanup(func() {
+		resetGracefulShutdownStateForTest(t)
+	})
+	resetInternalProviderServicesForTest(t)
+	registerServeTestProtocols(t)
+
+	internalSignal := false
+	shutdownCfg := global.DefaultShutdownConfig()
+	shutdownCfg.InternalSignal = &internalSignal
+	shutdownCfg.ConsumerUpdateWaitTime = "0s"
+	shutdownCfg.StepTimeout = "0s"
+	shutdownCfg.NotifyTimeout = "10ms"
+	shutdownCfg.OfflineRequestWindowTimeout = "0s"
+
+	srv, err := NewServer(SetServerShutdown(shutdownCfg))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- srv.ServeContext(ctx)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-serveDone:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("ServeContext did not return after context cancellation")
+	}
+
+	select {
+	case <-graceful_shutdown.Done():
+	case <-time.After(time.Second):
+		t.Fatal("process-level graceful shutdown did not finish after context cancellation")
+	}
+}
 
 // Test NewServer creates a server successfully
 func TestNewServer(t *testing.T) {
