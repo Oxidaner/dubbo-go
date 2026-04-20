@@ -20,6 +20,7 @@ package server
 
 import (
 	"context"
+	stderrors "errors"
 	"reflect"
 	"sort"
 	"strconv"
@@ -367,16 +368,13 @@ func (s *Server) ServeContext(ctx context.Context) error {
 	}
 
 	if err := s.exportServices(ctx); err != nil {
-		_ = s.rollbackServeStart(serviceInstanceRegistered)
-		return err
+		return s.rollbackServeStartWithCause(err, serviceInstanceRegistered)
 	}
 	if err := s.exportInternalServices(ctx); err != nil {
-		_ = s.rollbackServeStart(serviceInstanceRegistered)
-		return err
+		return s.rollbackServeStartWithCause(err, serviceInstanceRegistered)
 	}
 	if err := exposed_tmp.RegisterServiceInstanceContext(ctx); err != nil {
-		_ = s.rollbackServeStart(serviceInstanceRegistered)
-		return err
+		return s.rollbackServeStartWithCause(err, serviceInstanceRegistered)
 	}
 	serviceInstanceRegistered = true
 
@@ -384,8 +382,7 @@ func (s *Server) ServeContext(ctx context.Context) error {
 	probe.SetStartupComplete(true)
 	probe.SetReady(true)
 	if err := ctx.Err(); err != nil {
-		_ = s.rollbackServeStart(serviceInstanceRegistered)
-		return err
+		return s.rollbackServeStartWithCause(err, serviceInstanceRegistered)
 	}
 
 	if done := ctx.Done(); done != nil {
@@ -393,12 +390,19 @@ func (s *Server) ServeContext(ctx context.Context) error {
 		case <-graceful_shutdown.Done():
 			return graceful_shutdown.Shutdown(context.Background())
 		case <-done:
-			return graceful_shutdown.Shutdown(context.Background())
+			return graceful_shutdown.Shutdown(ctx)
 		}
 	}
 
 	<-graceful_shutdown.Done()
 	return graceful_shutdown.Shutdown(context.Background())
+}
+
+func (s *Server) rollbackServeStartWithCause(cause error, serviceInstanceRegistered bool) error {
+	if rollbackErr := s.rollbackServeStart(serviceInstanceRegistered); rollbackErr != nil {
+		return stderrors.Join(cause, errors.Wrap(rollbackErr, "startup rollback failed"))
+	}
+	return cause
 }
 
 func (s *Server) rollbackServeStart(serviceInstanceRegistered bool) error {

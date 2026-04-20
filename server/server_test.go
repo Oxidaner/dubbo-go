@@ -40,6 +40,7 @@ import (
 	"dubbo.apache.org/dubbo-go/v3/common/constant"
 	"dubbo.apache.org/dubbo-go/v3/common/extension"
 	"dubbo.apache.org/dubbo-go/v3/global"
+	"dubbo.apache.org/dubbo-go/v3/graceful_shutdown"
 	"dubbo.apache.org/dubbo-go/v3/protocol/base"
 	"dubbo.apache.org/dubbo-go/v3/registry"
 )
@@ -347,9 +348,15 @@ func TestServeContextReturnsAfterContextCancellation(t *testing.T) {
 
 	select {
 	case err := <-serveDone:
-		require.NoError(t, err)
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(time.Second):
 		t.Fatal("ServeContext did not return after context cancellation")
+	}
+
+	select {
+	case <-graceful_shutdown.Done():
+	case <-time.After(time.Second):
+		t.Fatal("process-level graceful shutdown did not finish after context cancellation")
 	}
 }
 
