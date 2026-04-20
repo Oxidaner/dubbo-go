@@ -40,7 +40,6 @@ import (
 	"dubbo.apache.org/dubbo-go/v3/common/constant"
 	"dubbo.apache.org/dubbo-go/v3/common/extension"
 	"dubbo.apache.org/dubbo-go/v3/global"
-	"dubbo.apache.org/dubbo-go/v3/graceful_shutdown"
 	"dubbo.apache.org/dubbo-go/v3/protocol/base"
 	"dubbo.apache.org/dubbo-go/v3/registry"
 )
@@ -145,6 +144,102 @@ func (r *mockServeRegistry) UnRegisterService() error {
 	return nil
 }
 
+type countingServeExporter struct {
+	invoker       base.Invoker
+	unexportCount *atomic.Int32
+}
+
+func (e *countingServeExporter) GetInvoker() base.Invoker {
+	return e.invoker
+}
+
+func (e *countingServeExporter) UnExport() {
+	if e.unexportCount != nil {
+		e.unexportCount.Add(1)
+	}
+	if e.invoker != nil {
+		e.invoker.Destroy()
+	}
+}
+
+type countingServeProtocol struct {
+	base.BaseProtocol
+	exportCount   *atomic.Int32
+	unexportCount *atomic.Int32
+}
+
+func (p *countingServeProtocol) Export(invoker base.Invoker) base.Exporter {
+	if p.exportCount != nil {
+		p.exportCount.Add(1)
+	}
+	return &countingServeExporter{
+		invoker:       invoker,
+		unexportCount: p.unexportCount,
+	}
+}
+
+type countingServeRegistry struct {
+	registerCount   *atomic.Int32
+	unregisterCount *atomic.Int32
+	registerBlock   <-chan struct{}
+}
+
+func (r *countingServeRegistry) GetURL() *common.URL {
+	return &common.URL{}
+}
+
+func (r *countingServeRegistry) IsAvailable() bool {
+	return true
+}
+
+func (r *countingServeRegistry) Destroy() {}
+
+func (r *countingServeRegistry) Register(*common.URL) error {
+	return nil
+}
+
+func (r *countingServeRegistry) UnRegister(*common.URL) error {
+	return nil
+}
+
+func (r *countingServeRegistry) Subscribe(*common.URL, registry.NotifyListener) error {
+	return nil
+}
+
+func (r *countingServeRegistry) UnSubscribe(*common.URL, registry.NotifyListener) error {
+	return nil
+}
+
+func (r *countingServeRegistry) LoadSubscribeInstances(*common.URL, registry.NotifyListener) error {
+	return nil
+}
+
+func (r *countingServeRegistry) RegisterService() error {
+	if r.registerCount != nil {
+		r.registerCount.Add(1)
+	}
+	if r.registerBlock != nil {
+		<-r.registerBlock
+	}
+	return nil
+}
+
+func (r *countingServeRegistry) UnRegisterService() error {
+	if r.unregisterCount != nil {
+		r.unregisterCount.Add(1)
+	}
+	return nil
+}
+
+type countingServeRegistryFactoryProtocol struct {
+	base.BaseProtocol
+	registry registry.Registry
+}
+
+func (p *countingServeRegistryFactoryProtocol) GetRegistries() []registry.Registry {
+	return []registry.Registry{p.registry}
+}
+
 func registerServeTestProtocols(t *testing.T) {
 	t.Helper()
 
@@ -161,6 +256,44 @@ func registerServeTestProtocols(t *testing.T) {
 		}
 		if _, ok := originalProtocols["dubbo"]; !ok {
 			extension.UnregisterProtocol("dubbo")
+		}
+		if _, ok := originalProtocols[constant.RegistryKey]; !ok {
+			extension.UnregisterProtocol(constant.RegistryKey)
+		}
+	})
+}
+
+func registerCountingServeTestProtocols(
+	t *testing.T,
+	exportCount, unexportCount, registerCount, unregisterCount *atomic.Int32,
+	registerBlock <-chan struct{},
+) {
+	t.Helper()
+
+	originalProtocols := extensionProtocols.Snapshot()
+	extension.SetProtocol(constant.TriProtocol, func() base.Protocol {
+		return &countingServeProtocol{
+			BaseProtocol:   base.NewBaseProtocol(),
+			exportCount:    exportCount,
+			unexportCount:  unexportCount,
+		}
+	})
+	extension.SetProtocol(constant.RegistryKey, func() base.Protocol {
+		return &countingServeRegistryFactoryProtocol{
+			BaseProtocol: base.NewBaseProtocol(),
+			registry: &countingServeRegistry{
+				registerCount:   registerCount,
+				unregisterCount: unregisterCount,
+				registerBlock:   registerBlock,
+			},
+		}
+	})
+	t.Cleanup(func() {
+		for name, factory := range originalProtocols {
+			extension.SetProtocol(name, factory)
+		}
+		if _, ok := originalProtocols[constant.TriProtocol]; !ok {
+			extension.UnregisterProtocol(constant.TriProtocol)
 		}
 		if _, ok := originalProtocols[constant.RegistryKey]; !ok {
 			extension.UnregisterProtocol(constant.RegistryKey)
@@ -201,6 +334,7 @@ func TestServeContextReturnsAfterContextCancellation(t *testing.T) {
 
 	srv, err := NewServer(SetServerShutdown(shutdownCfg))
 	require.NoError(t, err)
+	require.NoError(t, srv.Register(&MockServerRPCService{}, nil))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
@@ -213,16 +347,90 @@ func TestServeContextReturnsAfterContextCancellation(t *testing.T) {
 
 	select {
 	case err := <-serveDone:
-		require.ErrorIs(t, err, context.Canceled)
+		require.NoError(t, err)
 	case <-time.After(time.Second):
 		t.Fatal("ServeContext did not return after context cancellation")
 	}
+}
+
+func TestServeContextDoesNotStartWhenContextAlreadyCanceled(t *testing.T) {
+	resetGracefulShutdownStateForTest(t)
+	t.Cleanup(func() {
+		resetGracefulShutdownStateForTest(t)
+	})
+	resetInternalProviderServicesForTest(t)
+
+	var exportCount, unexportCount, registerCount, unregisterCount atomic.Int32
+	registerCountingServeTestProtocols(t, &exportCount, &unexportCount, &registerCount, &unregisterCount, nil)
+
+	internalSignal := false
+	shutdownCfg := global.DefaultShutdownConfig()
+	shutdownCfg.InternalSignal = &internalSignal
+	protocols := map[string]*global.ProtocolConfig{
+		constant.TriProtocol: global.DefaultProtocolConfig(),
+	}
+
+	srv, err := NewServer(SetServerShutdown(shutdownCfg), SetServerProtocols(protocols))
+	require.NoError(t, err)
+	require.NoError(t, srv.Register(&MockServerRPCService{}, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = srv.ServeContext(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, int32(0), exportCount.Load())
+	assert.Equal(t, int32(0), unexportCount.Load())
+	assert.Equal(t, int32(0), registerCount.Load())
+	assert.Equal(t, int32(0), unregisterCount.Load())
+}
+
+func TestServeContextRollsBackWhenCanceledDuringStartup(t *testing.T) {
+	resetGracefulShutdownStateForTest(t)
+	t.Cleanup(func() {
+		resetGracefulShutdownStateForTest(t)
+	})
+	resetInternalProviderServicesForTest(t)
+
+	var exportCount, unexportCount, registerCount, unregisterCount atomic.Int32
+	registerBlock := make(chan struct{})
+	registerCountingServeTestProtocols(t, &exportCount, &unexportCount, &registerCount, &unregisterCount, registerBlock)
+
+	internalSignal := false
+	shutdownCfg := global.DefaultShutdownConfig()
+	shutdownCfg.InternalSignal = &internalSignal
+	protocols := map[string]*global.ProtocolConfig{
+		constant.TriProtocol: global.DefaultProtocolConfig(),
+	}
+
+	srv, err := NewServer(SetServerShutdown(shutdownCfg), SetServerProtocols(protocols))
+	require.NoError(t, err)
+	require.NoError(t, srv.Register(&MockServerRPCService{}, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- srv.ServeContext(ctx)
+	}()
+
+	require.Eventually(t, func() bool {
+		return registerCount.Load() == 1
+	}, time.Second, 10*time.Millisecond)
+
+	cancel()
+	close(registerBlock)
 
 	select {
-	case <-graceful_shutdown.Done():
+	case err := <-serveDone:
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(time.Second):
-		t.Fatal("process-level graceful shutdown did not finish after context cancellation")
+		t.Fatal("ServeContext did not return after startup cancellation")
 	}
+
+	assert.Equal(t, int32(1), exportCount.Load())
+	assert.Equal(t, int32(1), unexportCount.Load())
+	assert.Equal(t, int32(1), registerCount.Load())
+	assert.Equal(t, int32(1), unregisterCount.Load())
 }
 
 // Test NewServer creates a server successfully
@@ -617,6 +825,17 @@ func (m *mockServerRPCService) Invoke(methodName string, params []any, results [
 }
 
 func (m *mockServerRPCService) Reference() string {
+	return "com.example.MockService"
+}
+
+// MockServerRPCService is an exported version used by protocol paths that reflect on handler types.
+type MockServerRPCService struct{}
+
+func (m *MockServerRPCService) Invoke(methodName string, params []any, results []any) error {
+	return nil
+}
+
+func (m *MockServerRPCService) Reference() string {
 	return "com.example.MockService"
 }
 

@@ -323,6 +323,9 @@ func (s *Server) ServeContext(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	s.mu.Lock()
 	if s.serve {
@@ -341,6 +344,8 @@ func (s *Server) ServeContext(ctx context.Context) error {
 		s.mu.Unlock()
 	}()
 
+	serviceInstanceRegistered := false
+
 	// the registryConfig in ServiceOptions and ServerOptions all need to init a metadataReporter,
 	// when ServiceOptions.init() is called we don't know if a new registry config is set in the future use serviceOption
 	if err := metadata.InitRegistryMetadataReport(s.cfg.Registries); err != nil {
@@ -355,32 +360,95 @@ func (s *Server) ServeContext(ctx context.Context) error {
 	if err := metadataOpts.Init(); err != nil {
 		return err
 	}
+	if err := s.rollbackOnStartupContextDone(ctx, serviceInstanceRegistered); err != nil {
+		return err
+	}
 
 	if err := s.exportServices(); err != nil {
 		return err
 	}
+	if err := s.rollbackOnStartupContextDone(ctx, serviceInstanceRegistered); err != nil {
+		return err
+	}
 	if err := s.exportInternalServices(); err != nil {
+		_ = s.rollbackServeStart(serviceInstanceRegistered)
+		return err
+	}
+	if err := s.rollbackOnStartupContextDone(ctx, serviceInstanceRegistered); err != nil {
 		return err
 	}
 	if err := exposed_tmp.RegisterServiceInstance(); err != nil {
+		_ = s.rollbackServeStart(serviceInstanceRegistered)
+		return err
+	}
+	serviceInstanceRegistered = true
+	if err := s.rollbackOnStartupContextDone(ctx, serviceInstanceRegistered); err != nil {
 		return err
 	}
 
 	// k8s probe ready
 	probe.SetStartupComplete(true)
 	probe.SetReady(true)
+	if err := s.rollbackOnStartupContextDone(ctx, serviceInstanceRegistered); err != nil {
+		return err
+	}
 
 	if done := ctx.Done(); done != nil {
 		select {
 		case <-graceful_shutdown.Done():
-			return graceful_shutdown.Shutdown(ctx)
+			return graceful_shutdown.Shutdown(context.Background())
 		case <-done:
-			return graceful_shutdown.Shutdown(ctx)
+			return graceful_shutdown.Shutdown(context.Background())
 		}
 	}
 
 	<-graceful_shutdown.Done()
 	return graceful_shutdown.Shutdown(context.Background())
+}
+
+func (s *Server) rollbackOnStartupContextDone(ctx context.Context, serviceInstanceRegistered bool) error {
+	if err := ctx.Err(); err != nil {
+		if rollbackErr := s.rollbackServeStart(serviceInstanceRegistered); rollbackErr != nil {
+			return rollbackErr
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Server) rollbackServeStart(serviceInstanceRegistered bool) error {
+	probe.SetReady(false)
+	probe.SetStartupComplete(false)
+
+	s.unexportInternalServices()
+	s.unexportServices()
+
+	if serviceInstanceRegistered {
+		if err := exposed_tmp.UnregisterServiceInstance(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) unexportServices() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, svcOpts := range s.svcOptsMap {
+		if svcOpts != nil {
+			svcOpts.Unexport()
+		}
+	}
+}
+
+func (s *Server) unexportInternalServices() {
+	internalProLock.Lock()
+	defer internalProLock.Unlock()
+	for _, service := range internalProServices {
+		if service != nil && service.svcOpts != nil {
+			service.svcOpts.Unexport()
+		}
+	}
 }
 
 // In order to expose internal services

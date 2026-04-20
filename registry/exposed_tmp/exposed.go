@@ -49,3 +49,23 @@ func RegisterServiceInstance() error {
 	}
 	return nil
 }
+
+// UnregisterServiceInstance unregisters the current service instance from all service discovery registries.
+func UnregisterServiceInstance() error {
+	defer func() {
+		if err := recover(); err != nil {
+			logger.Errorf("unregister service instance failed,please check if registry protocol is imported, error: %v", err)
+		}
+	}()
+	protocol := extension.GetProtocol(constant.RegistryKey)
+	if rf, ok := protocol.(registry.RegistryFactory); ok {
+		for _, r := range rf.GetRegistries() {
+			if sdr, ok := r.(registry.ServiceDiscoveryRegistry); ok {
+				if err := sdr.UnRegisterService(); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
