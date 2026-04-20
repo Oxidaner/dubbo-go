@@ -367,17 +367,9 @@ func (s *Server) ServeContext(ctx context.Context) error {
 	}
 
 	if err := s.exportServices(ctx); err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		s.unexportServices()
-		return err
+		_ = s.rollbackServeStart(serviceInstanceRegistered)
 	}
 	if err := s.exportInternalServices(ctx); err != nil {
-		_ = s.rollbackServeStart(serviceInstanceRegistered)
-		return err
-	}
-	if err := ctx.Err(); err != nil {
 		_ = s.rollbackServeStart(serviceInstanceRegistered)
 		return err
 	}
@@ -386,10 +378,6 @@ func (s *Server) ServeContext(ctx context.Context) error {
 		return err
 	}
 	serviceInstanceRegistered = true
-	if err := ctx.Err(); err != nil {
-		_ = s.rollbackServeStart(serviceInstanceRegistered)
-		return err
-	}
 
 	// k8s probe ready
 	probe.SetStartupComplete(true)
