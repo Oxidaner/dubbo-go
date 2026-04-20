@@ -368,6 +368,7 @@ func (s *Server) ServeContext(ctx context.Context) error {
 
 	if err := s.exportServices(ctx); err != nil {
 		_ = s.rollbackServeStart(serviceInstanceRegistered)
+		return err
 	}
 	if err := s.exportInternalServices(ctx); err != nil {
 		_ = s.rollbackServeStart(serviceInstanceRegistered)
