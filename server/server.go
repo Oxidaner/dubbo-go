@@ -360,21 +360,23 @@ func (s *Server) ServeContext(ctx context.Context) error {
 	if err := metadataOpts.Init(); err != nil {
 		return err
 	}
-	if err := s.rollbackOnStartupContextDone(ctx, serviceInstanceRegistered); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 
 	if err := s.exportServices(); err != nil {
 		return err
 	}
-	if err := s.rollbackOnStartupContextDone(ctx, serviceInstanceRegistered); err != nil {
+	if err := ctx.Err(); err != nil {
+		s.unexportServices()
 		return err
 	}
 	if err := s.exportInternalServices(); err != nil {
 		_ = s.rollbackServeStart(serviceInstanceRegistered)
 		return err
 	}
-	if err := s.rollbackOnStartupContextDone(ctx, serviceInstanceRegistered); err != nil {
+	if err := ctx.Err(); err != nil {
+		_ = s.rollbackServeStart(serviceInstanceRegistered)
 		return err
 	}
 	if err := exposed_tmp.RegisterServiceInstance(); err != nil {
@@ -382,14 +384,16 @@ func (s *Server) ServeContext(ctx context.Context) error {
 		return err
 	}
 	serviceInstanceRegistered = true
-	if err := s.rollbackOnStartupContextDone(ctx, serviceInstanceRegistered); err != nil {
+	if err := ctx.Err(); err != nil {
+		_ = s.rollbackServeStart(serviceInstanceRegistered)
 		return err
 	}
 
 	// k8s probe ready
 	probe.SetStartupComplete(true)
 	probe.SetReady(true)
-	if err := s.rollbackOnStartupContextDone(ctx, serviceInstanceRegistered); err != nil {
+	if err := ctx.Err(); err != nil {
+		_ = s.rollbackServeStart(serviceInstanceRegistered)
 		return err
 	}
 
@@ -404,16 +408,6 @@ func (s *Server) ServeContext(ctx context.Context) error {
 
 	<-graceful_shutdown.Done()
 	return graceful_shutdown.Shutdown(context.Background())
-}
-
-func (s *Server) rollbackOnStartupContextDone(ctx context.Context, serviceInstanceRegistered bool) error {
-	if err := ctx.Err(); err != nil {
-		if rollbackErr := s.rollbackServeStart(serviceInstanceRegistered); rollbackErr != nil {
-			return rollbackErr
-		}
-		return err
-	}
-	return nil
 }
 
 func (s *Server) rollbackServeStart(serviceInstanceRegistered bool) error {
