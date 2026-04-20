@@ -373,7 +373,7 @@ func (s *Server) ServeContext(ctx context.Context) error {
 		s.unexportServices()
 		return err
 	}
-	if err := s.exportInternalServices(); err != nil {
+	if err := s.exportInternalServices(ctx); err != nil {
 		_ = s.rollbackServeStart(serviceInstanceRegistered)
 		return err
 	}
@@ -381,7 +381,7 @@ func (s *Server) ServeContext(ctx context.Context) error {
 		_ = s.rollbackServeStart(serviceInstanceRegistered)
 		return err
 	}
-	if err := exposed_tmp.RegisterServiceInstance(); err != nil {
+	if err := exposed_tmp.RegisterServiceInstanceContext(ctx); err != nil {
 		_ = s.rollbackServeStart(serviceInstanceRegistered)
 		return err
 	}
@@ -448,7 +448,7 @@ func (s *Server) unexportInternalServices() {
 }
 
 // In order to expose internal services
-func (s *Server) exportInternalServices() error {
+func (s *Server) exportInternalServices(ctx context.Context) error {
 	cfg := &ServiceOptions{}
 
 	cfg.Application = s.cfg.Application
@@ -461,6 +461,9 @@ func (s *Server) exportInternalServices() error {
 	internalProLock.Lock()
 	defer internalProLock.Unlock()
 	for _, service := range internalProServices {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if service.Init == nil {
 			return errors.New("[internal service]internal service init func is empty, please set the init func correctly")
 		}
@@ -483,6 +486,9 @@ func (s *Server) exportInternalServices() error {
 	})
 
 	for _, service := range services {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if service.BeforeExport != nil {
 			service.BeforeExport(service.svcOpts)
 		}
