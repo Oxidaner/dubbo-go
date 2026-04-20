@@ -302,11 +302,13 @@ func enhanceServiceInfo(info *common.ServiceInfo) *common.ServiceInfo {
 	return info
 }
 
-func (s *Server) exportServices() error {
-	// add read lock to protect svcOptsMap data
+func (s *Server) exportServices(ctx context.Context) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, svcOpts := range s.svcOptsMap {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if err := svcOpts.Export(); err != nil {
 			logger.Errorf("export %s service failed, err: %s", svcOpts.Service.Interface, err)
 			return errors.Wrapf(err, "failed to export service %s", svcOpts.Service.Interface)
@@ -364,7 +366,7 @@ func (s *Server) ServeContext(ctx context.Context) error {
 		return err
 	}
 
-	if err := s.exportServices(); err != nil {
+	if err := s.exportServices(ctx); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {

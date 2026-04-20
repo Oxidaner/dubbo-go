@@ -273,9 +273,9 @@ func registerCountingServeTestProtocols(
 	originalProtocols := extensionProtocols.Snapshot()
 	extension.SetProtocol(constant.TriProtocol, func() base.Protocol {
 		return &countingServeProtocol{
-			BaseProtocol:   base.NewBaseProtocol(),
-			exportCount:    exportCount,
-			unexportCount:  unexportCount,
+			BaseProtocol:  base.NewBaseProtocol(),
+			exportCount:   exportCount,
+			unexportCount: unexportCount,
 		}
 	})
 	extension.SetProtocol(constant.RegistryKey, func() base.Protocol {
@@ -943,7 +943,8 @@ func TestExportServicesEmpty(t *testing.T) {
 	srv, err := NewServer()
 	require.NoError(t, err)
 
-	err = srv.exportServices()
+	ctx := context.Background()
+	err = srv.exportServices(ctx)
 	assert.NoError(t, err)
 }
 
