@@ -39,16 +39,78 @@ func init() {
 	extension.SetFilter(constant.MetricsFilterKey, newFilter)
 }
 
+/**
+* 事件驱动 + 异步收集
+时间线 ─────────────────────────────────────────────────────────────────────────►
+
+[RPC调用开始]
+    │
+    │  ┌────────────────────────────────────────────────────────────────┐
+    │  │ ① Filter.Invoke() 发布 BeforeInvokeEvent                       │
+    │  │    metrics.Publish(rpc.NewBeforeInvokeEvent(...))              │
+    │  └────────────────────────────────────────────────────────────────┘
+    │                              │
+    │                              ▼
+    │  ┌────────────────────────────────────────────────────────────────┐
+    │  │ ② Bus.Publish() 写入 channel                                   │
+    │  │    listener["rpc"] <- event  // 非阻塞发送                       │
+    │  └────────────────────────────────────────────────────────────────┘
+    │                              │
+    │                              ▼
+    │  ┌────────────────────────────────────────────────────────────────┐
+    │  │ ③ Collector 异步消费                                            │
+    │  │    event := <- rpcMetricsChan                                  │
+    │  │    beforeInvokeHandler()                                       │
+    │  │    → recordQps()                                               │
+    │  │    → incRequestsProcessingTotal()                              │
+    │  └────────────────────────────────────────────────────────────────┘
+    │                              │
+    │                              ▼
+    │  ┌────────────────────────────────────────────────────────────────┐
+    │  │ ④ 执行实际RPC调用 (invoker.Invoke())                             │
+    │  │    【业务逻辑执行...】                                            │
+    │  └────────────────────────────────────────────────────────────────┘
+    │                              │
+    │                              ▼
+    │  ┌────────────────────────────────────────────────────────────────┐
+    │  │ ⑤ Filter 发布 AfterInvokeEvent (带耗时和结果)                     │
+    │  │    metrics.Publish(rpc.NewAfterInvokeEvent(..., duration, res))│
+    │  └────────────────────────────────────────────────────────────────┘
+    │                              │
+    │                              ▼
+    │  ┌────────────────────────────────────────────────────────────────┐
+    │  │ ⑥ Bus.Publish() 写入 channel                                   │
+    │  └────────────────────────────────────────────────────────────────┘
+    │                              │
+    │                              ▼
+    │  ┌────────────────────────────────────────────────────────────────┐
+    │  │ ⑦ Collector 异步消费                                            │
+    │  │    event := <- rpcMetricsChan                                  │
+    │  │    afterInvokeHandler()                                        │
+    │  │    → incRequestsTotal()                                        │
+    │  │    → incRequestsSucceed/FailedTotal()                          │
+    │  │    → reportRTMilliseconds()                                    │
+    │  └────────────────────────────────────────────────────────────────┘
+    │
+[RPC调用结束]
+*/
+
 // metricsFilter will report RPC metrics to the metrics bus and implements the filter.Filter interface
 type metricsFilter struct{}
 
 // Invoke publish the BeforeInvokeEvent and AfterInvokeEvent to metrics bus
 func (mf *metricsFilter) Invoke(ctx context.Context, invoker base.Invoker, invocation base.Invocation) result.Result {
+
+	// ① RPC调用前：发布 BeforeInvokeEvent
 	metrics.Publish(rpc.NewBeforeInvokeEvent(invoker, invocation))
+
+	// ② 记录开始时间，执行实际调用
 	start := time.Now()
 	res := invoker.Invoke(ctx, invocation)
 	end := time.Now()
 	duration := end.Sub(start)
+
+	// ③ RPC调用后：发布 AfterInvokeEvent（携带耗时和结果）
 	metrics.Publish(rpc.NewAfterInvokeEvent(invoker, invocation, duration, res))
 	return res
 }

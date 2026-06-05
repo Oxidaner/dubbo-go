@@ -138,12 +138,13 @@ func (c *CenterConfig) toURL() (*common.URL, error) {
 // it will prepare the environment
 func startConfigCenter(rc *RootConfig) error {
 	cc := rc.ConfigCenter
+	// 1. 获取动态配置客户端（根据协议选择具体实现）
 	dynamicConfig, err := cc.GetDynamicConfiguration()
 	if err != nil {
 		logger.Errorf("[Config Center] Start dynamic configuration center error, error message is %v", err)
 		return err
 	}
-
+	// 2. 从配置中心拉取配置
 	strConf, err := dynamicConfig.GetProperties(cc.DataId, config_center.WithGroup(cc.Group))
 	if err != nil {
 		logger.Warnf("[Config Center] Dynamic config center has started, but config may not be initialized, because: %s", err)
@@ -155,38 +156,46 @@ func startConfigCenter(rc *RootConfig) error {
 			"Please check if your config-center config is correct.", cc)
 		return nil
 	}
+	// 3. 解析配置（支持 yaml/properties 等格式）
 	config := NewLoaderConf(WithDelim("."), WithGenre(cc.FileExtension), WithBytes([]byte(strConf)))
+	// 4. 反序列化到 RootConfig
 	koan := GetConfigResolver(config)
 	if err = koan.UnmarshalWithConf(rc.Prefix(), rc, koanf.UnmarshalConf{Tag: "yaml"}); err != nil {
 		return err
 	}
-
+	// 5. 添加监听器（支持热更新）
 	dynamicConfig.AddListener(cc.DataId, rc, config_center.WithGroup(cc.Group))
 	return nil
 }
 
 func (c *CenterConfig) CreateDynamicConfiguration() (config_center.DynamicConfiguration, error) {
+	// 1. 构建配置中心 URL
 	configCenterUrl, err := c.toURL()
 	if err != nil {
 		return nil, err
 	}
+	// 2. 根据协议获取工厂
 	factory, err := extension.GetConfigCenterFactory(configCenterUrl.Protocol)
 	if err != nil {
 		return nil, err
 	}
+	// 3. 创建客户端
 	return factory.GetDynamicConfiguration(configCenterUrl)
 }
 
 func (c *CenterConfig) GetDynamicConfiguration() (config_center.DynamicConfiguration, error) {
+	// 这是一个全局环境实例，用于存储应用级别的共享配置：
 	envInstance := conf.GetEnvInstance()
+	// 检查是否已经有动态配置，如果有就直接返回（单例模式）
 	if envInstance.GetDynamicConfiguration() != nil {
 		return envInstance.GetDynamicConfiguration(), nil
 	}
-	dynamicConfig, err := c.CreateDynamicConfiguration()
+	// 只有在第一次调用时才创建实例，避免不必要的资源占用：
+	dynamicConfig, err := c.CreateDynamicConfiguration() // 首次调用时创建实例
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	envInstance.SetDynamicConfiguration(dynamicConfig)
+	envInstance.SetDynamicConfiguration(dynamicConfig) // 缓存起来
 	return dynamicConfig, nil
 }
 

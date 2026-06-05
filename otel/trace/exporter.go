@@ -95,8 +95,8 @@ func NewExporter(config *ExporterConfig, customFunc func() (sdktrace.SpanExporte
 
 	tracerProvider = sdktrace.NewTracerProvider(
 		samplerOption,
-		sdktrace.WithBatcher(exporter),
-		sdktrace.WithResource(resource.NewSchemaless(
+		sdktrace.WithBatcher(exporter), // Span 处理器
+		sdktrace.WithResource(resource.NewSchemaless( // 服务资源信息
 			semconv.ServiceNamespace(config.ServiceNamespace),
 			semconv.ServiceName(config.ServiceName),
 			semconv.ServiceVersion(config.ServiceVersion),

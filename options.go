@@ -84,6 +84,34 @@ func defaultInstanceOptions() *InstanceOptions {
 }
 
 func (rc *InstanceOptions) init(opts ...InstanceOption) error {
+	/*
+
+		1. 应用用户 Option → 修改 InstanceOptions (rc)
+		           ↓
+		2. compatRootConfig(rc) → 转换为 RootConfig (rcCompat)
+		           ↓
+		3. rcCompat.Logger.Init() → 初始化日志
+		           ↓
+		4. rcCompat.ConfigCenter.Init() → 初始化配置中心
+		   ├─ 失败 → 跳过，继续使用本地配置
+		   └─ 成功 → 从远程拉取配置，更新 rcCompat
+		           ↓
+		      compatInstanceOptions(rcCompat, rc) ← 第一次回写！
+		           ↓
+		5. rcCompat.Application.Init() → 初始化应用配置
+		6. rcCompat.Protocols.Init() → 初始化协议
+		7. rcCompat.Registries.Init() → 初始化注册中心
+		8. ... 其他组件初始化 ...
+		           ↓
+		9. config.SetRootConfig(*rcCompat) → 设置全局旧配置
+		           ↓
+		10. rc.initMetadataReport() → 初始化元数据
+		11. metadata.InitRegistryMetadataReport()
+		           ↓
+		12. compatInstanceOptions(rcCompat, rc) ← 第二次回写！
+
+	*/
+
 	for _, opt := range opts {
 		opt(rc)
 	}

@@ -38,17 +38,77 @@ import (
 	"dubbo.apache.org/dubbo-go/v3/protocol/result"
 )
 
+/*
+*
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     OTel Trace 分布式追踪架构                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌─────────────────┐        RPC调用          ┌─────────────────┐            │
+│   │   Consumer      │ ─────────────────────► │   Provider      │            │
+│   │ (Client Filter) │                        │ (Server Filter) │            │
+│   └────────┬────────┘                        └────────┬────────┘            │
+│            │                                          │                     │
+│            │ ① Start Client Span                      │                     │
+│            │ ② Inject Context → Attachments           │                     │
+│            │                                          │                     │
+│            │─────────────────────────────────────────►│                     │
+│            │                                          │ ③ Extract Context   │
+│            │                                          │ ④ Start Server Span │
+│            │                                          │                     │
+│            │◄─────────────────────────────────────────│                     │
+│            │                                          │ ⑤ End Server Span   │
+│            │ ⑥ End Client Span                        │                     │
+│            │                                          │                     │
+│   ┌────────▼────────┐                        ┌────────▼────────┐            │
+│   │  TracerProvider │                        │  TracerProvider │            │
+│   │  (创建Span)      │                        │  (创建Span)     │            │
+│   └────────┬────────┘                        └────────┬────────┘            │
+│            │                                          │                     │
+│            └──────────────────┬───────────────────────┘                     │
+│                               ▼                                             │
+│                    ┌─────────────────┐                                      │
+│                    │  OTel Collector  │                                     │
+│                    │  (聚合Span数据)   │                                     │
+│                    └────────┬────────┘                                      │
+│                             ▼                                               │
+│              ┌─────────────────────────┐                                    │
+│              │  Zipkin/Jaeger/OTLP      │  (可视化展示)                       │
+│              └─────────────────────────┘                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Span 关系图：                                                               │
+│                                                                             │
+│     trace-id: abc123                                                        │
+│     ┌──────────────────────────────────────────────────────────────────┐    │
+│     │  Client Span                                                     │    │
+│     │  span-id: 001                                                    │    │
+│     │  parent-span-id: (root)                                          │    │
+│     │  ┌────────────────────────────────────────────────────────────┐  │    │
+│     │  │  Server Span                                               │  │    │
+│     │  │  span-id: 002                                              │  │    │
+│     │  │  parent-span-id: 001                                       │  │    │
+│     │  └────────────────────────────────────────────────────────────┘  │    │
+│     └──────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
+*/
 func init() {
 	// TODO: use single filter to simplify filter field in configuration
+	// 注册服务端追踪Filter
 	extension.SetFilter(constant.OTELServerTraceKey, func() filter.Filter {
 		return &otelServerFilter{
-			Propagators:    otel.GetTextMapPropagator(),
+			// 在上下文中注入/提取Trace Context
+			Propagators: otel.GetTextMapPropagator(),
+			// 创建Tracer实例，管理Span生命周期
 			TracerProvider: otel.GetTracerProvider(),
 		}
 	})
+	// 注册客户端追踪Filter
 	extension.SetFilter(constant.OTELClientTraceKey, func() filter.Filter {
 		return &otelClientFilter{
-			Propagators:    otel.GetTextMapPropagator(),
+			// 在上下文中注入/提取Trace Context
+			Propagators: otel.GetTextMapPropagator(),
+			// 创建Tracer实例，管理Span生命周期
 			TracerProvider: otel.GetTracerProvider(),
 		}
 	})
@@ -69,29 +129,36 @@ func (f *otelServerFilter) OnResponse(ctx context.Context, result result.Result,
 }
 
 func (f *otelServerFilter) Invoke(ctx context.Context, invoker base.Invoker, invocation base.Invocation) result.Result {
+	// ① 从Attachments中提取上游传递的Trace Context
 	attachments := invocation.Attachments()
 	bags, spanCtx := Extract(ctx, attachments, f.Propagators)
 	ctx = baggage.ContextWithBaggage(ctx, bags)
 
+	//	创建Span，设置Span属性和状态
+	// ② 获取Tracer（命名空间 + 版本号）
 	tracer := f.TracerProvider.Tracer(
 		constant.TraceScopeName,
 		trace.WithInstrumentationVersion(constant.Version),
 	)
 
+	// 代表一次RPC调用的追踪单元
+	// ③ 创建Server Span（关联上游Span作为父Span）
 	ctx, span := tracer.Start(
-		trace.ContextWithRemoteSpanContext(ctx, spanCtx),
+		trace.ContextWithRemoteSpanContext(ctx, spanCtx), // 关键：关联父Span
 		invocation.ActualMethodName(),
-		trace.WithSpanKind(trace.SpanKindServer),
+		trace.WithSpanKind(trace.SpanKindServer), // 标识为服务端Span
 		trace.WithAttributes(
-			semconv.RPCSystemApacheDubbo,
-			semconv.RPCService(invoker.GetURL().ServiceKey()),
-			semconv.RPCMethod(invocation.MethodName()),
+			semconv.RPCSystemApacheDubbo,                      // RPC框架标识
+			semconv.RPCService(invoker.GetURL().ServiceKey()), // 服务名
+			semconv.RPCMethod(invocation.MethodName()),        // 方法名
 		),
 	)
-	defer span.End()
+	defer span.End() // ④ 调用结束时自动关闭Span
 
+	// ⑤ 执行实际RPC调用
 	res := invoker.Invoke(ctx, invocation)
 
+	// ⑥ 根据结果设置Span状态
 	if res.Error() != nil {
 		span.SetStatus(codes.Error, res.Error().Error())
 	} else {
@@ -115,34 +182,42 @@ func (f *otelClientFilter) OnResponse(ctx context.Context, result result.Result,
 }
 
 func (f *otelClientFilter) Invoke(ctx context.Context, invoker base.Invoker, invocation base.Invocation) result.Result {
+	//	创建Span，设置Span属性和状态
+	// ① 获取Tracer
 	tracer := f.TracerProvider.Tracer(
 		constant.TraceScopeName,
 		trace.WithInstrumentationVersion(constant.Version),
 	)
 
+	// 代表一次RPC调用的追踪单元
+	// ② 创建Client Span
 	var span trace.Span
 	ctx, span = tracer.Start(
 		ctx,
 		invocation.ActualMethodName(),
-		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithSpanKind(trace.SpanKindClient), // 标识为客户端Span
 		trace.WithAttributes(
 			semconv.RPCSystemApacheDubbo,
 			semconv.RPCService(invoker.GetURL().ServiceKey()),
 			semconv.RPCMethod(invocation.MethodName()),
 		),
 	)
-	defer span.End()
+	defer span.End() // ③ 调用结束时自动关闭Span
 
+	// ④ 将Trace Context注入到Attachments
 	attachments := invocation.Attachments()
 	if attachments == nil {
 		attachments = map[string]any{}
 	}
-	Inject(ctx, attachments, f.Propagators)
+	Inject(ctx, attachments, f.Propagators) // 关键：注入Context
 	for k, v := range attachments {
 		invocation.SetAttachment(k, v)
 	}
+
+	// ⑤ 执行实际RPC调用
 	res := invoker.Invoke(ctx, invocation)
 
+	// ⑥ 根据结果设置Span状态
 	if res.Error() != nil {
 		span.SetStatus(codes.Error, res.Error().Error())
 	} else {

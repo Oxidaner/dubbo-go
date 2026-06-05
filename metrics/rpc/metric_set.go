@@ -37,29 +37,29 @@ type consumerMetrics struct {
 
 // rpcCommonMetrics is the common metrics for both provider and consumer
 type rpcCommonMetrics struct {
-	qpsTotal                      metrics.QpsMetricVec
-	requestsTotal                 metrics.CounterVec
-	requestsTotalAggregate        metrics.AggregateCounterVec
-	requestsProcessingTotal       metrics.GaugeVec
-	requestsSucceedTotal          metrics.CounterVec
-	requestsSucceedTotalAggregate metrics.AggregateCounterVec
-	requestsFailedTotal           metrics.CounterVec
-	requestsFailedTotalAggregate  metrics.AggregateCounterVec
-	rtMilliseconds                metrics.RtVec
-	rtMillisecondsQuantiles       metrics.QuantileMetricVec
-	rtMillisecondsAggregate       metrics.RtVec
+	qpsTotal                      metrics.QpsMetricVec        // QPS 每秒请求数
+	requestsTotal                 metrics.CounterVec          // requests provider收到的请求总数
+	requestsTotalAggregate        metrics.AggregateCounterVec // requests 滑动窗口下provider收到的请求总数
+	requestsProcessingTotal       metrics.GaugeVec            // requests provider正在处理的请求数量
+	requestsSucceedTotal          metrics.CounterVec          // requests 累计成功请求数
+	requestsSucceedTotalAggregate metrics.AggregateCounterVec // requests 滑动窗口下provider中成功请求数
+	requestsFailedTotal           metrics.CounterVec          // requests 累计失败请求数
+	requestsFailedTotalAggregate  metrics.AggregateCounterVec // requests 滑动窗口下provider中失败请求数
+	rtMilliseconds                metrics.RtVec               // requests 响应时间 毫秒
+	rtMillisecondsQuantiles       metrics.QuantileMetricVec   // requests 响应时间 毫秒分位数
+	rtMillisecondsAggregate       metrics.RtVec               // requests 滑动窗口下provider中响应时间 毫秒
 
 	// Granular error metrics
-	requestsTimeoutTotal                     metrics.CounterVec
-	requestsTimeoutTotalAggregate            metrics.AggregateCounterVec
-	requestsLimitTotal                       metrics.CounterVec
-	requestsLimitTotalAggregate              metrics.AggregateCounterVec
-	requestsServiceUnavailableTotal          metrics.CounterVec
-	requestsServiceUnavailableTotalAggregate metrics.AggregateCounterVec
-	requestsBusinessFailedTotal              metrics.CounterVec
-	requestsBusinessFailedTotalAggregate     metrics.AggregateCounterVec
-	requestsUnknownFailedTotal               metrics.CounterVec
-	requestsUnknownFailedTotalAggregate      metrics.AggregateCounterVec
+	requestsTimeoutTotal                     metrics.CounterVec          // requests 超时请求数 累计超时请求数
+	requestsTimeoutTotalAggregate            metrics.AggregateCounterVec // requests 滑动窗口下provider中超时请求数
+	requestsLimitTotal                       metrics.CounterVec          // requests 限流请求数 累计限流请求数
+	requestsLimitTotalAggregate              metrics.AggregateCounterVec // requests 滑动窗口下provider中限流请求数
+	requestsServiceUnavailableTotal          metrics.CounterVec          // requests 服务不可用请求数 累计服务不可用请求数
+	requestsServiceUnavailableTotalAggregate metrics.AggregateCounterVec // requests 滑动窗口下provider中服务不可用请求数
+	requestsBusinessFailedTotal              metrics.CounterVec          // requests 业务失败请求数 累计业务失败请求数
+	requestsBusinessFailedTotalAggregate     metrics.AggregateCounterVec // requests 滑动窗口下provider中业务失败请求数
+	requestsUnknownFailedTotal               metrics.CounterVec          // requests 未知失败请求数 累计未知失败请求数
+	requestsUnknownFailedTotalAggregate      metrics.AggregateCounterVec // requests 滑动窗口下provider中未知失败请求数
 }
 
 // buildMetricSet will call init functions to initialize the metricSet

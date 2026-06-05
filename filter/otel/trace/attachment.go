@@ -29,12 +29,15 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// metadataSupplier 实现了 OTel 的 TextMapCarrier 接口
+// 用于适配 Dubbo Attachments 与 OTel 上下文传递协议
 type metadataSupplier struct {
 	metadata map[string]any
 }
 
-var _ propagation.TextMapCarrier = (*metadataSupplier)(nil)
+var _ propagation.TextMapCarrier = (*metadataSupplier)(nil) // 接口断言
 
+// Get 从Attachments中获取指定key的值
 func (s *metadataSupplier) Get(key string) string {
 	if s.metadata == nil {
 		return ""
@@ -49,6 +52,7 @@ func (s *metadataSupplier) Get(key string) string {
 	return item[0]
 }
 
+// Set 将Trace Context写入Attachments
 func (s *metadataSupplier) Set(key string, value string) {
 	if s.metadata == nil {
 		s.metadata = map[string]any{}
@@ -56,6 +60,7 @@ func (s *metadataSupplier) Set(key string, value string) {
 	s.metadata[key] = value
 }
 
+// Keys 返回所有key
 func (s *metadataSupplier) Keys() []string {
 	out := make([]string, 0, len(s.metadata))
 	for key := range s.metadata {
@@ -67,6 +72,8 @@ func (s *metadataSupplier) Keys() []string {
 // Inject injects correlation context and span context into the dubbo
 // metadata object. This function is meant to be used on outgoing
 // requests.
+
+// Inject: 将SpanContext注入到Dubbo Attachments
 func Inject(ctx context.Context, metadata map[string]any, propagators propagation.TextMapPropagator) {
 	propagators.Inject(ctx, &metadataSupplier{
 		metadata: metadata,
@@ -76,6 +83,7 @@ func Inject(ctx context.Context, metadata map[string]any, propagators propagatio
 // Extract returns the baggage and span context that
 // another service encoded in the dubbo metadata object with Inject.
 // This function is meant to be used on incoming requests.
+// Extract: 从Dubbo Attachments中提取SpanContext
 func Extract(ctx context.Context, metadata map[string]any, propagators propagation.TextMapPropagator) (baggage.Baggage, trace.SpanContext) {
 	ctx = propagators.Extract(ctx, &metadataSupplier{
 		metadata: metadata,
