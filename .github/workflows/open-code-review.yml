@@ -1,0 +1,277 @@
+name: OpenCodeReview PR Review
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to review
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  code-review:
+    name: Review pull request
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        (
+          startsWith(github.event.comment.body, '/open-code-review') ||
+          startsWith(github.event.comment.body, '@open-code-review')
+        )
+      )
+
+    steps:
+      - name: Get pull request context
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.eventName === 'workflow_dispatch'
+              ? Number(core.getInput('pr_number'))
+              : context.issue.number;
+
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
+              core.setFailed(`Invalid pull request number: ${prNumber}`);
+              return;
+            }
+
+            const { data: pullRequest } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            core.setOutput('number', String(prNumber));
+            core.setOutput('base_ref', pullRequest.base.ref);
+            core.setOutput('head_sha', pullRequest.head.sha);
+            core.setOutput('title', pullRequest.title || '');
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.pr.outputs.base_ref }}
+
+      - name: Fetch pull request refs
+        env:
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr/${PR_NUMBER}"
+          git checkout --detach "${HEAD_SHA}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install OpenCodeReview
+        run: npm install -g @alibaba-group/open-code-review
+
+      - name: Configure OpenCodeReview
+        env:
+          OCR_LLM_URL: ${{ secrets.OCR_LLM_URL }}
+          OCR_LLM_AUTH_TOKEN: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          OCR_LLM_MODEL: ${{ secrets.OCR_LLM_MODEL }}
+          OCR_LLM_USE_ANTHROPIC: ${{ secrets.OCR_LLM_USE_ANTHROPIC }}
+          OCR_LLM_AUTH_HEADER: ${{ secrets.OCR_LLM_AUTH_HEADER }}
+        run: |
+          ocr config set llm.url "${OCR_LLM_URL}"
+          ocr config set llm.auth_token "${OCR_LLM_AUTH_TOKEN}"
+          ocr config set llm.model "${OCR_LLM_MODEL:-gpt-4o}"
+
+          if [ -n "${OCR_LLM_USE_ANTHROPIC}" ]; then
+            ocr config set llm.use_anthropic "${OCR_LLM_USE_ANTHROPIC}"
+          fi
+
+          if [ -n "${OCR_LLM_AUTH_HEADER}" ]; then
+            ocr config set llm.auth_header "${OCR_LLM_AUTH_HEADER}"
+          fi
+
+          ocr config set llm.extra_body '{"thinking": {"type": "disabled"}}'
+
+      - name: Run OpenCodeReview
+        id: review
+        env:
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_TITLE: ${{ steps.pr.outputs.title }}
+        run: |
+          ocr review \
+            --from "origin/${BASE_REF}" \
+            --to "${HEAD_SHA}" \
+            --format json \
+            --background "${PR_TITLE}" \
+            > "${RUNNER_TEMP}/ocr-result.json" \
+            2> "${RUNNER_TEMP}/ocr-stderr.log" || true
+
+          echo "OpenCodeReview stdout:"
+          cat "${RUNNER_TEMP}/ocr-result.json"
+          echo
+          echo "OpenCodeReview stderr:"
+          cat "${RUNNER_TEMP}/ocr-stderr.log"
+
+      - name: Post review comments
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const prNumber = Number(process.env.PR_NUMBER);
+            const commitSha = process.env.HEAD_SHA;
+            const resultPath = `${process.env.RUNNER_TEMP}/ocr-result.json`;
+            const stderrPath = `${process.env.RUNNER_TEMP}/ocr-stderr.log`;
+
+            let result;
+            try {
+              result = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+            } catch (error) {
+              const stderr = fs.existsSync(stderrPath)
+                ? fs.readFileSync(stderrPath, 'utf8').trim()
+                : '';
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: [
+                  'OpenCodeReview could not parse its JSON output.',
+                  stderr ? `\n\`\`\`\n${stderr.slice(0, 6000)}\n\`\`\`` : '',
+                ].join('\n'),
+              });
+              return;
+            }
+
+            const comments = Array.isArray(result.comments) ? result.comments : [];
+            const warnings = Array.isArray(result.warnings) ? result.warnings : [];
+
+            if (comments.length === 0) {
+              const message = result.message || 'No comments generated. Looks good to me.';
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: `OpenCodeReview: ${message}`,
+              });
+              return;
+            }
+
+            const inlineComments = [];
+            const summaryComments = [];
+
+            for (const comment of comments) {
+              const body = formatInlineComment(comment);
+              const path = comment.path;
+              const startLine = Number(comment.start_line || 0);
+              const endLine = Number(comment.end_line || 0);
+
+              if (!path || (startLine < 1 && endLine < 1)) {
+                summaryComments.push(comment);
+                continue;
+              }
+
+              const reviewComment = { path, body };
+              if (startLine >= 1 && endLine >= 1 && startLine !== endLine) {
+                reviewComment.start_line = startLine;
+                reviewComment.line = endLine;
+                reviewComment.start_side = 'RIGHT';
+                reviewComment.side = 'RIGHT';
+              } else {
+                reviewComment.line = endLine >= 1 ? endLine : startLine;
+                reviewComment.side = 'RIGHT';
+              }
+
+              inlineComments.push(reviewComment);
+            }
+
+            const summary = [
+              `OpenCodeReview found ${comments.length} issue(s).`,
+              `- ${inlineComments.length} inline comment(s) prepared`,
+              `- ${summaryComments.length} summary item(s) without line info`,
+              warnings.length > 0 ? `- ${warnings.length} warning(s) reported` : '',
+            ].filter(Boolean).join('\n');
+
+            if (inlineComments.length > 0) {
+              try {
+                await github.rest.pulls.createReview({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber,
+                  commit_id: commitSha,
+                  body: buildSummaryBody(summary, summaryComments),
+                  event: 'COMMENT',
+                  comments: inlineComments,
+                });
+                return;
+              } catch (error) {
+                summaryComments.unshift({
+                  path: 'OpenCodeReview',
+                  content: `Could not post inline comments through the Pull Request Review API: ${error.message}`,
+                });
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: buildSummaryBody(summary, comments),
+            });
+
+            function formatInlineComment(comment) {
+              let body = comment.content || '';
+              if (comment.suggestion_code && comment.existing_code) {
+                body += '\n\nSuggestion:\n';
+                body += '```suggestion\n';
+                body += comment.suggestion_code;
+                if (!comment.suggestion_code.endsWith('\n')) {
+                  body += '\n';
+                }
+                body += '```';
+              }
+              return body || 'OpenCodeReview comment';
+            }
+
+            function buildSummaryBody(summary, items) {
+              const parts = [summary];
+              for (const item of items) {
+                parts.push(formatSummaryComment(item));
+              }
+              return parts.join('\n\n---\n\n');
+            }
+
+            function formatSummaryComment(comment) {
+              const path = comment.path || 'Unknown file';
+              const startLine = comment.start_line ? `L${comment.start_line}` : '';
+              const endLine = comment.end_line ? `L${comment.end_line}` : '';
+              const range = startLine || endLine
+                ? ` (${startLine}${startLine && endLine ? '-' : ''}${endLine})`
+                : '';
+              let markdown = `### \`${path}\`${range}\n\n${comment.content || ''}`;
+
+              if (comment.suggestion_code && comment.existing_code) {
+                markdown += '\n\nSuggested change:\n\n';
+                markdown += 'Before:\n```\n' + comment.existing_code + '\n```\n\n';
+                markdown += 'After:\n```\n' + comment.suggestion_code + '\n```';
+              }
+
+              return markdown;
+            }
