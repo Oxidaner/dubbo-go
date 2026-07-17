@@ -99,8 +99,14 @@ func init() {
 		return &otelServerFilter{
 			// 在上下文中注入/提取Trace Context
 			Propagators: otel.GetTextMapPropagator(),
-			// 创建Tracer实例，管理Span生命周期
-			TracerProvider: otel.GetTracerProvider(),
+			/**
+			创建Tracer实例，管理Span生命周期
+			TracerProvider 是创建 Tracer 的工厂，负责：
+			- 管理 Tracer 的创建和配置
+			- 控制 Span 的采样策略
+			- 管理 Span 处理器（SpanProcessor）
+			*/
+			TracerProvider: otel.GetTracerProvider(), // 获取全局默认的 TracerProvider
 		}
 	})
 	// 注册客户端追踪Filter
