@@ -20,8 +20,10 @@ package definition
 import (
 	"context"
 	"reflect"
+	"sort"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 import (
@@ -32,6 +34,7 @@ import (
 import (
 	"dubbo.apache.org/dubbo-go/v3/common"
 	"dubbo.apache.org/dubbo-go/v3/common/constant"
+	"dubbo.apache.org/dubbo-go/v3/common/dubboutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -274,6 +277,43 @@ func TestBuildStructPropertiesFollowGeneralizerNaming(t *testing.T) {
 	assert.NotContains(t, addr.Properties, "Zip", "the Go name is not the wire name when a tag exists")
 }
 
+// TestPublishedPropertiesMatchTheResolver is the guarantee the shared resolver
+// exists to provide: a published property name is, by construction, the key
+// MapGeneralizer emits and the key Realize accepts. Deriving names here
+// independently is exactly the drift this asserts against.
+func TestPublishedPropertiesMatchTheResolver(t *testing.T) {
+	for _, typ := range []reflect.Type{
+		reflect.TypeFor[Address](),
+		reflect.TypeFor[User](),
+		reflect.TypeFor[Node](),
+		reflect.TypeFor[squashOuter](),
+		reflect.TypeFor[dashTagged](),
+		reflect.TypeFor[optionTagged](),
+	} {
+		t.Run(typ.Name(), func(t *testing.T) {
+			flat, err := dubboutil.FlattenGenericFields(typ)
+			require.NoError(t, err)
+
+			want := make([]string, 0, len(flat.Fields))
+			for _, field := range flat.Fields {
+				if field.Ignored {
+					continue
+				}
+				want = append(want, field.Name)
+			}
+
+			got := make([]string, 0)
+			for name := range propertiesOf(t, typ) {
+				got = append(got, name)
+			}
+
+			sort.Strings(want)
+			sort.Strings(got)
+			assert.Equal(t, want, got)
+		})
+	}
+}
+
 func TestBuildRecursiveTypeTerminates(t *testing.T) {
 	def, _ := build(t, &basicService{})
 
@@ -406,7 +446,8 @@ type dashTagged struct {
 }
 
 type optionTagged struct {
-	Name string `m:"name,omitempty"`
+	Name  string `m:"name,omitempty"`
+	Other string
 }
 
 type nonASCIINamed struct {
@@ -418,16 +459,108 @@ type aliasColliding struct {
 	Other string `m:"name"`
 }
 
-func TestFieldNameTransitionConstraints(t *testing.T) {
+type squashInner struct {
+	Code string
+	Kind string `m:"kind"`
+}
+
+type squashOuter struct {
+	Inner squashInner `m:",squash"`
+	Name  string
+}
+
+// squashColliding flattens squashInner.Code onto the same key as its own Code.
+type squashColliding struct {
+	Inner squashInner `m:",squash"`
+	Code  string
+}
+
+type remainHolder struct {
+	Name  string
+	Extra map[string]any `m:",remain"`
+}
+
+func propertiesOf(t *testing.T, typ reflect.Type) map[string]string {
+	t.Helper()
+	c := newTypeCollector()
+	expr, err := c.resolve(typ)
+	require.NoError(t, err)
+	return c.defs[expr].Properties
+}
+
+func TestConstraintsLiftedByTheSharedResolver(t *testing.T) {
+	// Each of these used to disqualify the whole method, because the schema and
+	// MapGeneralizer derived names independently and disagreed. One resolver
+	// settles all of them.
+	t.Run(`m:"-" drops only that field`, func(t *testing.T) {
+		properties := propertiesOf(t, reflect.TypeFor[dashTagged]())
+		assert.Equal(t, map[string]string{"keep": "string"}, properties)
+		assert.NotContains(t, properties, "-",
+			`m:"-" must not publish a field literally named "-"`)
+	})
+
+	t.Run("tag options are honoured, not rejected", func(t *testing.T) {
+		// omitempty changes whether a value is sent, not what it is called, so
+		// the property is published under the tag name.
+		properties := propertiesOf(t, reflect.TypeFor[optionTagged]())
+		assert.Equal(t, map[string]string{"name": "string", "other": "string"}, properties)
+		assert.NotContains(t, properties, "name,omitempty")
+	})
+
+	t.Run("non-ASCII field names round-trip", func(t *testing.T) {
+		properties := propertiesOf(t, reflect.TypeFor[nonASCIINamed]())
+		assert.Equal(t, map[string]string{"ünicode": "string"}, properties)
+		for name := range properties {
+			assert.True(t, utf8.ValidString(name), "byte-slicing the first rune would corrupt this")
+		}
+	})
+}
+
+// TestSquashIsPublishedFlat is a correctness fix, not a nicety. Generalize
+// merges a squashed struct into its parent map and mapstructure hoists the same
+// fields when decoding, so a definition describing the nested shape would have
+// Admin build a request the provider silently decodes into a zero value.
+func TestSquashIsPublishedFlat(t *testing.T) {
+	properties := propertiesOf(t, reflect.TypeFor[squashOuter]())
+
+	assert.Equal(t, map[string]string{
+		"code": "string",
+		"kind": "string",
+		"name": "string",
+	}, properties)
+	assert.NotContains(t, properties, "inner",
+		"the squashed field is not a key on the wire")
+}
+
+func TestSquashedTypeIsNotPublishedSeparately(t *testing.T) {
+	// Nothing can reach it: no property references the squashed struct, so an
+	// entry for it would be an orphan implying a nesting level that never exists.
+	c := newTypeCollector()
+	_, err := c.resolve(reflect.TypeFor[squashOuter]())
+	require.NoError(t, err)
+
+	assert.NotContains(t, c.defs,
+		"dubbo.apache.org/dubbo-go/v3/metadata/definition.squashInner")
+}
+
+func TestRemainFieldIsNotPublished(t *testing.T) {
+	// A remain field collects whatever matched nothing; it has no fixed schema
+	// to advertise.
+	properties := propertiesOf(t, reflect.TypeFor[remainHolder]())
+	assert.Equal(t, map[string]string{"name": "string"}, properties)
+	assert.NotContains(t, properties, "extra")
+}
+
+func TestFieldNameStillRejected(t *testing.T) {
 	cases := []struct {
 		name    string
 		typ     reflect.Type
 		wantMsg string
 	}{
-		{`m:"-"`, reflect.TypeOf(dashTagged{}), `skipped by Realize`},
-		{"tag option", reflect.TypeOf(optionTagged{}), "interpreted differently"},
-		{"non-ASCII field", reflect.TypeOf(nonASCIINamed{}), "non-ASCII"},
-		{"canonical/legacy collision", reflect.TypeOf(aliasColliding{}), "both reachable as"},
+		{"tag collides with a sibling's Go name", reflect.TypeFor[aliasColliding](), "both reachable as"},
+		// Squash makes collisions easy to introduce by accident: the inner ID
+		// and the outer ID both flatten onto "id".
+		{"squash collides with the parent", reflect.TypeFor[squashColliding](), "both reachable as"},
 	}
 
 	for _, tc := range cases {

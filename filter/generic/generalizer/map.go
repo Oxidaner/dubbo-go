@@ -18,14 +18,10 @@
 package generalizer
 
 import (
-	"maps"
 	"reflect"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
-	"unicode"
-	"unicode/utf8"
 )
 
 import (
@@ -41,6 +37,7 @@ import (
 import (
 	"dubbo.apache.org/dubbo-go/v3/common/config"
 	"dubbo.apache.org/dubbo-go/v3/common/constant"
+	"dubbo.apache.org/dubbo-go/v3/common/dubboutil"
 	"dubbo.apache.org/dubbo-go/v3/protocol/dubbo/hessian2"
 )
 
@@ -76,7 +73,17 @@ func (g *MapGeneralizer) Realize(obj any, typ reflect.Type) (any, error) {
 	newobj := reflect.New(typ).Interface()
 	decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
 		Result:  newobj,
-		TagName: "m",
+		TagName: dubboutil.GenericTag,
+		// Re-key each incoming map to exactly what mapstructure looks up,
+		// resolving wire names, legacy Go names and ignored fields through the
+		// same resolver Generalize uses. Without this the two directions agree
+		// on the name a field is written under but not on the names it can be
+		// read back from. The hook fires at every nesting level.
+		DecodeHook: normalizeGenericFieldsHook,
+		// The hook has already resolved every key, so matching is exact.
+		// Leaving the default EqualFold would let a key the resolver
+		// deliberately rejected still land on a field by folding into it.
+		MatchName: func(mapKey, fieldName string) bool { return mapKey == fieldName },
 	})
 	if err != nil {
 		return nil, perrors.Errorf("creating map decoder failed, %v", err)
@@ -88,6 +95,84 @@ func (g *MapGeneralizer) Realize(obj any, typ reflect.Type) (any, error) {
 	}
 
 	return reflect.ValueOf(newobj).Elem().Interface(), nil
+}
+
+// normalizeGenericFieldsHook rewrites a map destined for a struct so every key
+// is the one mapstructure will look up for its field.
+func normalizeGenericFieldsHook(_ reflect.Type, to reflect.Type, data any) (any, error) {
+	if to.Kind() != reflect.Struct {
+		return data, nil
+	}
+	entries, ok := stringKeyedEntries(data)
+	if !ok {
+		return data, nil
+	}
+
+	flat, err := dubboutil.FlattenGenericFields(to)
+	if err != nil {
+		return nil, err
+	}
+
+	normalized := make(map[string]any, len(entries))
+	claimedBy := make(map[string]string, len(entries))
+
+	for key, value := range entries {
+		field, matched := dubboutil.MatchGenericField(key, flat.Fields)
+		if !matched {
+			if flat.HasRemain {
+				// A remain field collects whatever matched nothing, so those
+				// keys have to survive as-is for mapstructure to hand them
+				// over. Dropping them here would leave remain silently empty.
+				normalized[key] = value
+				continue
+			}
+			// Otherwise unknown keys stay silently ignored, as they were when
+			// the decoder ran with ErrorUnused false. Callers routinely send
+			// extras — "class" among them — and rejecting those would break
+			// working providers.
+			logger.Debugf("[Filter][Generic] key %q does not match any field of %s, ignoring", key, to)
+			continue
+		}
+		if field.Ignored {
+			logger.Debugf("[Filter][Generic] key %q targets ignored field %s.%s, dropping", key, to, field.GoName)
+			continue
+		}
+		if previous, taken := claimedBy[field.DecodeKey]; taken {
+			// Two spellings of one field, typically the wire name and the
+			// legacy Go name arriving together. Picking one would make the
+			// result depend on map iteration order.
+			return nil, perrors.Errorf("keys %q and %q both target field %s.%s",
+				previous, key, to, field.GoName)
+		}
+		claimedBy[field.DecodeKey] = key
+		normalized[field.DecodeKey] = value
+	}
+
+	return normalized, nil
+}
+
+// stringKeyedEntries flattens the two map shapes that reach the decoder:
+// map[string]any from objToMap's struct branch, and map[any]any from its map
+// branch and from hessian-decoded payloads.
+func stringKeyedEntries(data any) (map[string]any, bool) {
+	switch typed := data.(type) {
+	case map[string]any:
+		return typed, true
+	case map[any]any:
+		entries := make(map[string]any, len(typed))
+		for key, value := range typed {
+			name, ok := key.(string)
+			if !ok {
+				// A struct field name is always a string, so a non-string key
+				// cannot target one.
+				continue
+			}
+			entries[name] = value
+		}
+		return entries, true
+	default:
+		return nil, false
+	}
 }
 
 func (g *MapGeneralizer) GetType(obj any) (typ string, err error) {
@@ -189,8 +274,8 @@ func objToMap(obj any) (any, error) {
 		for i := 0; i < t.NumField(); i++ {
 			field := t.Field(i)
 			value := v.Field(i)
-			tag := parseMTag(field)
-			if tag.ignore || tag.omitEmpty && isEmptyValue(value) {
+			tag := dubboutil.GenericFieldOf(field)
+			if tag.Ignored || tag.Remain || tag.OmitEmpty && isEmptyValue(value) {
 				continue
 			}
 			kind := value.Kind()
@@ -222,16 +307,32 @@ func objToMap(obj any) (any, error) {
 			if err != nil {
 				return nil, err
 			}
-			if tag.squash {
+			if tag.Squash {
 				squashed, ok := generalizedValue.(map[string]any)
 				if !ok {
 					return nil, perrors.Errorf("cannot squash non-struct type '%s'", value.Type())
 				}
 				delete(squashed, "class")
-				maps.Copy(result, squashed)
+				// Merging key by key rather than maps.Copy so a squashed field
+				// that lands on a name the parent already used is reported
+				// instead of silently overwriting it. dubboutil.FlattenGenericFields
+				// rejects the same shape statically, which is what stops a
+				// service definition from advertising the ambiguous name; this
+				// is the runtime half of the guarantee.
+				for key, squashedValue := range squashed {
+					if _, taken := result[key]; taken {
+						return nil, perrors.Errorf(
+							"squashing %s of %s would overwrite key %q", field.Name, t, key)
+					}
+					result[key] = squashedValue
+				}
 				continue
 			}
-			result[tag.name] = generalizedValue
+			if _, taken := result[tag.Name]; taken {
+				return nil, perrors.Errorf("field %s of %s would overwrite key %q",
+					field.Name, t, tag.Name)
+			}
+			result[tag.Name] = generalizedValue
 		}
 		return result, nil
 	case reflect.Array, reflect.Slice:
@@ -286,39 +387,6 @@ func mapKey(key reflect.Value) any {
 	}
 }
 
-type mTag struct {
-	name      string
-	ignore    bool
-	omitEmpty bool
-	squash    bool
-}
-
-func parseMTag(field reflect.StructField) mTag {
-	tag := mTag{name: toUnexport(field.Name)}
-	tagValue := field.Tag.Get("m")
-	name, options, hasOptions := strings.Cut(tagValue, ",")
-	if name == "-" {
-		tag.ignore = true
-		return tag
-	}
-	if name != "" {
-		tag.name = name
-	}
-	if !hasOptions {
-		return tag
-	}
-
-	for option := range strings.SplitSeq(options, ",") {
-		switch option {
-		case "omitempty":
-			tag.omitEmpty = true
-		case "squash":
-			tag.squash = true
-		}
-	}
-	return tag
-}
-
 func isEmptyValue(value reflect.Value) bool {
 	switch value.Kind() {
 	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
@@ -336,19 +404,6 @@ func isEmptyValue(value reflect.Value) bool {
 	default:
 		return false
 	}
-}
-
-// toUnexport lowercases the first rune of a.
-//
-// Rune-based rather than byte-based: strings.ToLower(a[:1]) splits a multi-byte
-// leading rune, so an exported field named with a non-ASCII letter used to
-// generalize to a key containing an invalid UTF-8 fragment.
-func toUnexport(a string) string {
-	if a == "" {
-		return a
-	}
-	first, size := utf8.DecodeRuneInString(a)
-	return string(unicode.ToLower(first)) + a[size:]
 }
 
 // isPrimitive determines if the object is primitive

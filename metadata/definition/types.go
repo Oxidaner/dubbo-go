@@ -22,9 +22,10 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
-	"strings"
-	"unicode"
-	"unicode/utf8"
+)
+
+import (
+	"dubbo.apache.org/dubbo-go/v3/common/dubboutil"
 )
 
 // maxTypeDepth bounds structural nesting. The visited set already terminates
@@ -219,85 +220,45 @@ func (c *typeCollector) resolveStruct(t reflect.Type, depth int) (string, error)
 	return expr, nil
 }
 
+// structProperties maps the struct's wire-visible fields to their types.
+//
+// Naming is delegated to the shared resolver, which is the point of it
+// existing: the property names published here are, by construction, the keys
+// MapGeneralizer emits and the keys Realize accepts. Deriving them
+// independently is exactly how a definition ends up advertising a name the
+// provider will not honour.
+//
+// The resolver returns the flattened view, so a field tagged m:",squash" is not
+// published as a nested object — its inner fields appear directly here, matching
+// the flat map the wire actually carries. Publishing the nested shape instead
+// would fail silently: Admin would build a nested request, mapstructure would
+// look for the inner names at the top level, and the squashed struct would
+// decode to its zero value with no error anywhere.
+//
+// A struct the resolver refuses — two fields contesting one name, which squash
+// makes easy to introduce — is reported as unsupported so the owning method is
+// dropped rather than published ambiguously.
 func (c *typeCollector) structProperties(t reflect.Type, expr string, depth int) (map[string]string, error) {
-	properties := make(map[string]string)
-	// matchSets records, per wire name, the field that claimed it. mapstructure
-	// matches case-insensitively, so collisions are detected on the folded name.
-	matchSets := make(map[string]string)
+	flat, err := dubboutil.FlattenGenericFields(t)
+	if err != nil {
+		return nil, unsupported(expr, err.Error())
+	}
 
-	for i := range t.NumField() {
-		field := t.Field(i)
-		if field.PkgPath != "" {
-			// Unexported. MapGeneralizer skips these too (CanInterface is
-			// false), so they are genuinely absent from the wire format.
+	properties := make(map[string]string, len(flat.Fields))
+	for _, field := range flat.Fields {
+		if field.Ignored {
+			// m:"-" is absent from the wire form in both directions, so it has
+			// no property to publish.
 			continue
 		}
-
-		wireName, err := fieldWireName(field)
-		if err != nil {
-			return nil, err
-		}
-
-		// A field is reachable under its wire name and, for backwards
-		// compatibility with generic callers written before m tags existed, its
-		// original Go field name — both case-insensitively. Two fields whose
-		// reachable sets overlap make both the schema property and the Realize
-		// target depend on field iteration order.
-		for _, alias := range []string{wireName, field.Name} {
-			folded := strings.ToLower(alias)
-			if owner, taken := matchSets[folded]; taken && owner != field.Name {
-				return nil, unsupported(expr, fmt.Sprintf(
-					"fields %q and %q are both reachable as %q", owner, field.Name, alias))
-			}
-			matchSets[folded] = field.Name
-		}
-
 		fieldExpr, err := c.resolveAt(field.Type, depth+1)
 		if err != nil {
 			return nil, err
 		}
-		properties[wireName] = fieldExpr
+		properties[field.Name] = fieldExpr
 	}
 
 	return properties, nil
-}
-
-// fieldWireName returns the map key MapGeneralizer.setInMap would emit for this
-// field, rejecting every case where Generalize and Realize currently disagree.
-//
-// These rejections are the proposal's transition constraint. They lift once the
-// shared GenericFieldName resolver lands and both directions read the tag the
-// same way; until then, publishing a schema for these fields would describe a
-// wire format that only one direction honours.
-func fieldWireName(field reflect.StructField) (string, error) {
-	tag, tagged := field.Tag.Lookup("m")
-	if !tagged || tag == "" {
-		first, size := utf8.DecodeRuneInString(field.Name)
-		if size > 1 {
-			// toUnexport lowercases via strings.ToLower(name[:1]), a byte slice.
-			// On a multi-byte leading rune that splits the rune and produces
-			// invalid UTF-8, so there is no wire name to publish.
-			return "", unsupported(field.Name,
-				"non-ASCII field names are mangled by the current Generalize path")
-		}
-		return string(unicode.ToLower(first)) + field.Name[size:], nil
-	}
-
-	if tag == "-" {
-		// Generalize writes a literal "-" key; mapstructure reads "-" as skip.
-		// The field is therefore emitted but never read back.
-		return "", unsupported(field.Name,
-			`m:"-" is written as a literal "-" key by Generalize but skipped by Realize`)
-	}
-
-	if strings.Contains(tag, ",") {
-		// Generalize uses the entire tag as the key ("name,omitempty");
-		// mapstructure parses off the option and uses "name".
-		return "", unsupported(field.Name,
-			fmt.Sprintf("m tag option in %q is interpreted differently by Generalize and Realize", tag))
-	}
-
-	return tag, nil
 }
 
 // namedTypeKey returns the fully qualified name of a named type, or "" if the
