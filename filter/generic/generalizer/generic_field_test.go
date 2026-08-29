@@ -191,7 +191,7 @@ func TestRealizeWillNotWriteIgnoredFieldByGoName(t *testing.T) {
 	}
 }
 
-// TestRealizeIgnoresUnknownKeys preserves existing behaviour. Callers routinely
+// TestRealizeIgnoresUnknownKeys preserves existing behavior. Callers routinely
 // send extras — "class" among them — and rejecting those would break working
 // providers.
 func TestRealizeIgnoresUnknownKeys(t *testing.T) {
@@ -304,7 +304,7 @@ func TestSquashCollisionRejectedInBothDirections(t *testing.T) {
 	}
 
 	_, err := GetMapGeneralizer().Generalize(colliding{})
-	assert.Error(t, err, "the flattened key space has two fields named code")
+	require.Error(t, err, "the flattened key space has two fields named code")
 
 	_, err = GetMapGeneralizer().Realize(
 		map[string]any{"code": "c"}, reflect.TypeFor[colliding]())

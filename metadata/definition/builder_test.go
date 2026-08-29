@@ -40,7 +40,6 @@ import (
 // ---------------------------------------------------------------------------
 // fixtures
 // ---------------------------------------------------------------------------
-
 type Address struct {
 	City   string
 	Zip    string `m:"zipCode"`
@@ -409,7 +408,7 @@ func TestBuildNamedScalarUsesUnderlyingType(t *testing.T) {
 	// A named scalar travels the generic wire as its underlying value, so the
 	// contract names that rather than the Go type name.
 	c := newTypeCollector()
-	expr, err := c.resolve(reflect.TypeOf(time.Month(1)))
+	expr, err := c.resolve(reflect.TypeFor[time.Month]())
 	require.NoError(t, err)
 	assert.Equal(t, "long", expr, "Go int is 64-bit here, matching getBasicJavaName")
 }
@@ -420,7 +419,7 @@ func TestBuildNamedScalarUsesUnderlyingType(t *testing.T) {
 
 func TestBuildCanonicalNameComesFromURL(t *testing.T) {
 	u := testURL(t, "org.example.UserService", "1.0.0", "g1")
-	def, _, err := BuildFromURL(u, reflect.TypeOf(&basicService{}))
+	def, _, err := BuildFromURL(u, reflect.TypeFor[*basicService]())
 	require.NoError(t, err)
 
 	assert.Equal(t, "org.example.UserService", def.CanonicalName,
@@ -463,7 +462,7 @@ func TestBuildDropsBothSidesOfANameCollision(t *testing.T) {
 func TestRuntimeStillRegistersCollidingMethods(t *testing.T) {
 	// The builder refuses to publish a collision, but registration must keep
 	// working so existing services still start after an upgrade.
-	methods := common.CanonicalMethods(reflect.TypeOf(&collidingService{}))
+	methods := common.CanonicalMethods(reflect.TypeFor[*collidingService]())
 	conflicts := common.MethodNameConflicts(methods)
 	require.Len(t, conflicts, 1)
 	assert.Equal(t, "Echo", conflicts[0].WireName)
@@ -578,7 +577,7 @@ func TestConstraintsLiftedByTheSharedResolver(t *testing.T) {
 			`m:"-" must not publish a field literally named "-"`)
 	})
 
-	t.Run("tag options are honoured, not rejected", func(t *testing.T) {
+	t.Run("tag options are honored, not rejected", func(t *testing.T) {
 		// omitempty changes whether a value is sent, not what it is called, so
 		// the property is published under the tag name.
 		properties := propertiesOf(t, reflect.TypeFor[optionTagged]())
@@ -653,7 +652,7 @@ func TestFieldNameStillRejected(t *testing.T) {
 }
 
 func TestUnsupportedIsDistinguishableFromInternalError(t *testing.T) {
-	_, err := newTypeCollector().resolve(reflect.TypeOf(make(chan int)))
+	_, err := newTypeCollector().resolve(reflect.TypeFor[chan int]())
 	require.Error(t, err)
 	assert.True(t, IsUnsupported(err))
 }
@@ -665,11 +664,11 @@ func TestUnsupportedIsDistinguishableFromInternalError(t *testing.T) {
 func TestBuildIsDeterministic(t *testing.T) {
 	// Republishing identical content on every restart is what keeps the
 	// metadata center from churning, so map iteration must not leak into output.
-	first, _, err := BuildFromURL(testURL(t, "org.example.Svc", "", ""), reflect.TypeOf(&basicService{}))
+	first, _, err := BuildFromURL(testURL(t, "org.example.Svc", "", ""), reflect.TypeFor[*basicService]())
 	require.NoError(t, err)
 
 	for range 20 {
-		next, _, err := BuildFromURL(testURL(t, "org.example.Svc", "", ""), reflect.TypeOf(&basicService{}))
+		next, _, err := BuildFromURL(testURL(t, "org.example.Svc", "", ""), reflect.TypeFor[*basicService]())
 		require.NoError(t, err)
 		assert.Equal(t, first.Types, next.Types)
 		assert.Equal(t, first.Methods, next.Methods)
@@ -681,14 +680,14 @@ func TestBuildIsDeterministic(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestBuildRejectsUnusableInput(t *testing.T) {
-	_, _, err := BuildFromURL(nil, reflect.TypeOf(&basicService{}))
-	assert.Error(t, err)
+	_, _, err := BuildFromURL(nil, reflect.TypeFor[*basicService]())
+	require.Error(t, err)
 
 	_, _, err = BuildFromURL(testURL(t, "org.example.Svc", "", ""), nil)
-	assert.Error(t, err)
+	require.Error(t, err)
 
-	_, _, err = BuildFromURL(testURL(t, "", "", ""), reflect.TypeOf(&basicService{}))
-	assert.Error(t, err, "an empty interface name cannot identify a definition")
+	_, _, err = BuildFromURL(testURL(t, "", "", ""), reflect.TypeFor[*basicService]())
+	require.Error(t, err, "an empty interface name cannot identify a definition")
 }
 
 // javaNamed declares a Java class name, as a hessian POJO does.

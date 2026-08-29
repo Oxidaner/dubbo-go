@@ -362,7 +362,7 @@ func (c *typeCollector) resolveStruct(t reflect.Type, depth int) (string, error)
 // existing: the property names published here are, by construction, the keys
 // MapGeneralizer emits and the keys Realize accepts. Deriving them
 // independently is exactly how a definition ends up advertising a name the
-// provider will not honour.
+// provider will not honor.
 //
 // The resolver returns the flattened view, so a field tagged m:",squash" is not
 // published as a nested object — its inner fields appear directly here, matching
